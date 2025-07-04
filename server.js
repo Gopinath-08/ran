@@ -33,18 +33,76 @@ const chatRooms = new Map();
 const videoRooms = new Map();
 const waitingUsers = new Map();
 
+// Track previous connections to avoid repeat matches
+const previousConnections = new Map(); // userId -> Set of previous partner IDs
+const userConnectionCount = new Map(); // userId -> number of connections made
+const userLastConnectionTime = new Map(); // userId -> timestamp of last connection
+
 // Helper functions
 function generateRoomId() {
   return uuidv4().substring(0, 8);
 }
 
-function getRandomUserFromWaiting(type) {
+function getRandomUserFromWaiting(type, currentUserId) {
   const waiting = Array.from(waitingUsers.values()).filter(user => user.type === type);
-  return waiting.length > 0 ? waiting[Math.floor(Math.random() * waiting.length)] : null;
+  
+  if (waiting.length === 0) return null;
+  
+  // Get user's previous connections
+  const userPreviousConnections = previousConnections.get(currentUserId) || new Set();
+  const currentUserConnectionCount = userConnectionCount.get(currentUserId) || 0;
+  
+  // Filter out users we've already connected with
+  const availablePartners = waiting.filter(user => 
+    user.id !== currentUserId && 
+    !userPreviousConnections.has(user.id)
+  );
+  
+  // If no new partners available, allow repeat connections but prioritize new ones
+  if (availablePartners.length === 0) {
+    console.log(`No new partners available for user ${currentUserId}, allowing repeat connections`);
+    
+    // Sort by connection count (prioritize users with fewer connections)
+    const sortedWaiting = waiting
+      .filter(user => user.id !== currentUserId)
+      .sort((a, b) => {
+        const aCount = userConnectionCount.get(a.id) || 0;
+        const bCount = userConnectionCount.get(b.id) || 0;
+        return aCount - bCount;
+      });
+    
+    return sortedWaiting.length > 0 ? sortedWaiting[0] : null;
+  }
+  
+  // Sort available partners by connection count (fair distribution)
+  const sortedPartners = availablePartners.sort((a, b) => {
+    const aCount = userConnectionCount.get(a.id) || 0;
+    const bCount = userConnectionCount.get(b.id) || 0;
+    return aCount - bCount;
+  });
+  
+  return sortedPartners[0];
 }
 
 function removeUserFromWaiting(userId) {
   waitingUsers.delete(userId);
+}
+
+function trackConnection(userId, partnerId) {
+  // Track previous connections
+  if (!previousConnections.has(userId)) {
+    previousConnections.set(userId, new Set());
+  }
+  previousConnections.get(userId).add(partnerId);
+  
+  // Update connection count
+  const currentCount = userConnectionCount.get(userId) || 0;
+  userConnectionCount.set(userId, currentCount + 1);
+  
+  // Update last connection time
+  userLastConnectionTime.set(userId, Date.now());
+  
+  console.log(`Tracked connection: ${userId} -> ${partnerId} (total connections: ${currentCount + 1})`);
 }
 
 function createRoom(user1, user2, type) {
@@ -92,12 +150,16 @@ io.on('connection', (socket) => {
     });
 
     // Try to find a partner
-    const partner = getRandomUserFromWaiting(type);
+    const partner = getRandomUserFromWaiting(type, userId);
     
     if (partner && partner.id !== userId) {
       // Remove both users from waiting
       removeUserFromWaiting(userId);
       removeUserFromWaiting(partner.id);
+
+      // Track the connection
+      trackConnection(userId, partner.id);
+      trackConnection(partner.id, userId);
 
       // Create room
       const room = createRoom(userId, partner.id, type);
@@ -237,16 +299,43 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Stats endpoint
+// Stats endpoint with connection tracking info
 app.get('/stats', (req, res) => {
+  const totalConnections = Array.from(userConnectionCount.values()).reduce((sum, count) => sum + count, 0);
+  const avgConnectionsPerUser = userConnectionCount.size > 0 ? totalConnections / userConnectionCount.size : 0;
+  
   res.json({
     activeUsers: activeUsers.size,
     chatRooms: chatRooms.size,
     videoRooms: videoRooms.size,
     waitingUsers: waitingUsers.size,
+    totalConnections,
+    avgConnectionsPerUser: Math.round(avgConnectionsPerUser * 100) / 100,
+    usersWithConnections: userConnectionCount.size,
     uptime: process.uptime()
   });
 });
+
+// Clean up old connection data (run every hour)
+setInterval(() => {
+  const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+  let cleanedCount = 0;
+  
+  for (const [userId, lastTime] of userLastConnectionTime.entries()) {
+    if (lastTime < oneDayAgo) {
+      previousConnections.delete(userId);
+      userConnectionCount.delete(userId);
+      userLastConnectionTime.delete(userId);
+      cleanedCount++;
+    }
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`Cleaned up connection data for ${cleanedCount} inactive users`);
+  }
+}, 60 * 60 * 1000); // Run every hour
+
+
 
 const PORT = process.env.PORT || 3000;
 
