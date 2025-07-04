@@ -48,40 +48,40 @@ function getRandomUserFromWaiting(type, currentUserId) {
   
   if (waiting.length === 0) return null;
   
-  // Get user's previous connections
+  // Get user's previous connections and connection count
   const userPreviousConnections = previousConnections.get(currentUserId) || new Set();
   const currentUserConnectionCount = userConnectionCount.get(currentUserId) || 0;
   
-  // Filter out users we've already connected with
-  const availablePartners = waiting.filter(user => 
-    user.id !== currentUserId && 
-    !userPreviousConnections.has(user.id)
-  );
+  // Filter out self
+  const availablePartners = waiting.filter(user => user.id !== currentUserId);
   
-  // If no new partners available, allow repeat connections but prioritize new ones
-  if (availablePartners.length === 0) {
-    console.log(`No new partners available for user ${currentUserId}, allowing repeat connections`);
-    
-    // Sort by connection count (prioritize users with fewer connections)
-    const sortedWaiting = waiting
-      .filter(user => user.id !== currentUserId)
-      .sort((a, b) => {
-        const aCount = userConnectionCount.get(a.id) || 0;
-        const bCount = userConnectionCount.get(b.id) || 0;
-        return aCount - bCount;
-      });
-    
-    return sortedWaiting.length > 0 ? sortedWaiting[0] : null;
-  }
+  if (availablePartners.length === 0) return null;
   
-  // Sort available partners by connection count (fair distribution)
-  const sortedPartners = availablePartners.sort((a, b) => {
-    const aCount = userConnectionCount.get(a.id) || 0;
-    const bCount = userConnectionCount.get(b.id) || 0;
-    return aCount - bCount;
+  // Create weighted scoring system for fair distribution
+  const scoredPartners = availablePartners.map(user => {
+    const partnerConnectionCount = userConnectionCount.get(user.id) || 0;
+    const hasConnectedBefore = userPreviousConnections.has(user.id);
+    
+    // Base score (lower connection count = higher priority)
+    let score = partnerConnectionCount;
+    
+    // Bonus for new connections (but not required)
+    if (!hasConnectedBefore) {
+      score -= 2; // Give slight preference to new connections
+    }
+    
+    // Add some randomness to keep it interesting
+    score += Math.random() * 0.5;
+    
+    return { user, score };
   });
   
-  return sortedPartners[0];
+  // Sort by score (lower score = higher priority)
+  scoredPartners.sort((a, b) => a.score - b.score);
+  
+  console.log(`Matching user ${currentUserId} with partner ${scoredPartners[0].user.id} (score: ${scoredPartners[0].score.toFixed(2)})`);
+  
+  return scoredPartners[0].user;
 }
 
 function removeUserFromWaiting(userId) {
@@ -89,6 +89,10 @@ function removeUserFromWaiting(userId) {
 }
 
 function trackConnection(userId, partnerId) {
+  // Check if this is a repeat connection
+  const hasConnectedBefore = previousConnections.has(userId) && 
+                            previousConnections.get(userId).has(partnerId);
+  
   // Track previous connections
   if (!previousConnections.has(userId)) {
     previousConnections.set(userId, new Set());
@@ -102,7 +106,13 @@ function trackConnection(userId, partnerId) {
   // Update last connection time
   userLastConnectionTime.set(userId, Date.now());
   
-  console.log(`Tracked connection: ${userId} -> ${partnerId} (total connections: ${currentCount + 1})`);
+  if (hasConnectedBefore) {
+    console.log(`Reconnecting: ${userId} -> ${partnerId} (total connections: ${currentCount + 1})`);
+  } else {
+    console.log(`New connection: ${userId} -> ${partnerId} (total connections: ${currentCount + 1})`);
+  }
+  
+  return hasConnectedBefore;
 }
 
 function createRoom(user1, user2, type) {
@@ -158,7 +168,7 @@ io.on('connection', (socket) => {
       removeUserFromWaiting(partner.id);
 
       // Track the connection
-      trackConnection(userId, partner.id);
+      const isRepeatConnection = trackConnection(userId, partner.id);
       trackConnection(partner.id, userId);
 
       // Create room
@@ -171,7 +181,8 @@ io.on('connection', (socket) => {
       // Notify both users
       io.to(room.id).emit('partner_found', {
         roomId: room.id,
-        partnerId: type === 'chat' ? partner.id : null // Don't expose partner ID in video calls for privacy
+        partnerId: type === 'chat' ? partner.id : null, // Don't expose partner ID in video calls for privacy
+        isRepeatConnection: isRepeatConnection
       });
 
       console.log(`Created ${type} room ${room.id} for users ${userId} and ${partner.id}`);
@@ -304,6 +315,14 @@ app.get('/stats', (req, res) => {
   const totalConnections = Array.from(userConnectionCount.values()).reduce((sum, count) => sum + count, 0);
   const avgConnectionsPerUser = userConnectionCount.size > 0 ? totalConnections / userConnectionCount.size : 0;
   
+  // Calculate engagement metrics
+  const mostActiveUser = Array.from(userConnectionCount.entries())
+    .sort(([,a], [,b]) => b - a)[0];
+  
+  const recentConnections = Array.from(userLastConnectionTime.entries())
+    .filter(([, time]) => time > Date.now() - (60 * 60 * 1000)) // Last hour
+    .length;
+  
   res.json({
     activeUsers: activeUsers.size,
     chatRooms: chatRooms.size,
@@ -312,7 +331,15 @@ app.get('/stats', (req, res) => {
     totalConnections,
     avgConnectionsPerUser: Math.round(avgConnectionsPerUser * 100) / 100,
     usersWithConnections: userConnectionCount.size,
-    uptime: process.uptime()
+    mostActiveUser: mostActiveUser ? { userId: mostActiveUser[0], connections: mostActiveUser[1] } : null,
+    recentConnections,
+    uptime: process.uptime(),
+    engagement: {
+      totalConnections,
+      avgConnectionsPerUser: Math.round(avgConnectionsPerUser * 100) / 100,
+      recentConnections,
+      activeUsers: activeUsers.size
+    }
   });
 });
 
