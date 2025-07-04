@@ -38,6 +38,74 @@ const previousConnections = new Map(); // userId -> Set of previous partner IDs
 const userConnectionCount = new Map(); // userId -> number of connections made
 const userLastConnectionTime = new Map(); // userId -> timestamp of last connection
 
+// --- Video call waiting queue and room management (Omegle-style) ---
+const videoWaitingQueue = [];
+const videoActiveRooms = new Map();
+const videoUserConnections = new Map();
+let videoRoomCounter = 0;
+
+function generateVideoRoomId() {
+  return `room_${++videoRoomCounter}_${Date.now()}`;
+}
+
+function removeFromVideoWaitingQueue(userId) {
+  const index = videoWaitingQueue.findIndex(user => user.userId === userId);
+  if (index !== -1) {
+    videoWaitingQueue.splice(index, 1);
+  }
+}
+
+function findVideoPartner(currentUser) {
+  removeFromVideoWaitingQueue(currentUser.userId);
+  for (let i = 0; i < videoWaitingQueue.length; i++) {
+    const partner = videoWaitingQueue[i];
+    if (partner.userId === currentUser.userId) continue;
+    videoWaitingQueue.splice(i, 1);
+    return partner;
+  }
+  return null;
+}
+
+function createVideoRoom(user1, user2) {
+  const roomId = generateVideoRoomId();
+  const room = {
+    id: roomId,
+    users: [user1, user2],
+    createdAt: Date.now(),
+    status: 'active'
+  };
+  videoActiveRooms.set(roomId, room);
+  videoUserConnections.set(user1.userId, { socketId: user1.socketId, roomId });
+  videoUserConnections.set(user2.userId, { socketId: user2.socketId, roomId });
+  return room;
+}
+
+function getVideoRoomByUserId(userId) {
+  const connection = videoUserConnections.get(userId);
+  if (connection) {
+    return videoActiveRooms.get(connection.roomId);
+  }
+  return null;
+}
+
+function leaveVideoRoom(userId, io) {
+  const connection = videoUserConnections.get(userId);
+  if (connection) {
+    const room = videoActiveRooms.get(connection.roomId);
+    if (room) {
+      const otherUser = room.users.find(u => u.userId !== userId);
+      if (otherUser) {
+        const otherSocket = io.sockets.sockets.get(otherUser.socketId);
+        if (otherSocket) {
+          otherSocket.emit('partner_disconnected');
+        }
+      }
+      videoActiveRooms.delete(connection.roomId);
+    }
+    videoUserConnections.delete(userId);
+  }
+}
+
 // Helper functions
 function generateRoomId() {
   return uuidv4().substring(0, 8);
@@ -196,6 +264,69 @@ io.on('connection', (socket) => {
     io.emit('user_count_update', { count: userCount });
   });
 
+  // --- Video call: Omegle-style join ---
+  socket.on('join_video_queue', (data) => {
+    const { userId, platform } = data;
+    const currentUser = {
+      userId,
+      socketId: socket.id,
+      platform: platform || 'web',
+      joinedAt: Date.now()
+    };
+    // Check for partner
+    const partner = findVideoPartner(currentUser);
+    if (partner) {
+      const room = createVideoRoom(currentUser, partner);
+      // Notify both users
+      socket.emit('partner_found', {
+        roomId: room.id,
+        partner: { userId: partner.userId, platform: partner.platform }
+      });
+      const partnerSocket = io.sockets.sockets.get(partner.socketId);
+      if (partnerSocket) {
+        partnerSocket.emit('partner_found', {
+          roomId: room.id,
+          partner: { userId: currentUser.userId, platform: currentUser.platform }
+        });
+      }
+    } else {
+      videoWaitingQueue.push(currentUser);
+      socket.emit('waiting_for_partner');
+    }
+  });
+
+  // --- Video call: Next partner ---
+  socket.on('next_partner', () => {
+    let userId = null;
+    for (const [id, conn] of videoUserConnections.entries()) {
+      if (conn.socketId === socket.id) {
+        userId = id;
+        break;
+      }
+    }
+    if (userId) {
+      leaveVideoRoom(userId, io);
+      // Re-join queue
+      socket.emit('waiting_for_partner');
+      videoWaitingQueue.push({ userId, socketId: socket.id, platform: 'web', joinedAt: Date.now() });
+    }
+  });
+
+  // --- Video call: Leave video ---
+  socket.on('leave_video', () => {
+    let userId = null;
+    for (const [id, conn] of videoUserConnections.entries()) {
+      if (conn.socketId === socket.id) {
+        userId = id;
+        break;
+      }
+    }
+    if (userId) {
+      leaveVideoRoom(userId, io);
+      removeFromVideoWaitingQueue(userId);
+    }
+  });
+
   // Chat message handling
   socket.on('send_message', (data) => {
     const { roomId, message } = data;
@@ -222,20 +353,77 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('user_typing', { isTyping });
   });
 
-  // WebRTC signaling for video calls
+  // --- Video call: WebRTC signaling ---
   socket.on('offer', (data) => {
-    const { roomId, offer } = data;
-    socket.to(roomId).emit('offer', { offer });
+    // If data.roomId, use chat/videoRooms; else, use videoActiveRooms
+    if (data.roomId) {
+      socket.to(data.roomId).emit('offer', { offer: data.offer });
+    } else {
+      // Video call (Omegle-style)
+      let userId = null;
+      for (const [id, conn] of videoUserConnections.entries()) {
+        if (conn.socketId === socket.id) {
+          userId = id;
+          break;
+        }
+      }
+      const room = getVideoRoomByUserId(userId);
+      if (room) {
+        const otherUser = room.users.find(u => u.userId !== userId);
+        if (otherUser) {
+          const otherSocket = io.sockets.sockets.get(otherUser.socketId);
+          if (otherSocket) {
+            otherSocket.emit('offer', { offer: data.offer });
+          }
+        }
+      }
+    }
   });
-
   socket.on('answer', (data) => {
-    const { roomId, answer } = data;
-    socket.to(roomId).emit('answer', { answer });
+    if (data.roomId) {
+      socket.to(data.roomId).emit('answer', { answer: data.answer });
+    } else {
+      let userId = null;
+      for (const [id, conn] of videoUserConnections.entries()) {
+        if (conn.socketId === socket.id) {
+          userId = id;
+          break;
+        }
+      }
+      const room = getVideoRoomByUserId(userId);
+      if (room) {
+        const otherUser = room.users.find(u => u.userId !== userId);
+        if (otherUser) {
+          const otherSocket = io.sockets.sockets.get(otherUser.socketId);
+          if (otherSocket) {
+            otherSocket.emit('answer', { answer: data.answer });
+          }
+        }
+      }
+    }
   });
-
   socket.on('ice_candidate', (data) => {
-    const { roomId, candidate } = data;
-    socket.to(roomId).emit('ice_candidate', { candidate });
+    if (data.roomId) {
+      socket.to(data.roomId).emit('ice_candidate', { candidate: data.candidate });
+    } else {
+      let userId = null;
+      for (const [id, conn] of videoUserConnections.entries()) {
+        if (conn.socketId === socket.id) {
+          userId = id;
+          break;
+        }
+      }
+      const room = getVideoRoomByUserId(userId);
+      if (room) {
+        const otherUser = room.users.find(u => u.userId !== userId);
+        if (otherUser) {
+          const otherSocket = io.sockets.sockets.get(otherUser.socketId);
+          if (otherSocket) {
+            otherSocket.emit('ice_candidate', { candidate: data.candidate });
+          }
+        }
+      }
+    }
   });
 
   // User disconnection
@@ -279,6 +467,18 @@ io.on('connection', (socket) => {
       io.emit('user_count_update', { count: userCount });
 
       console.log(`User disconnected: ${user.id}`);
+    }
+    // Clean up video queue/rooms
+    let userId = null;
+    for (const [id, conn] of videoUserConnections.entries()) {
+      if (conn.socketId === socket.id) {
+        userId = id;
+        break;
+      }
+    }
+    if (userId) {
+      leaveVideoRoom(userId, io);
+      removeFromVideoWaitingQueue(userId);
     }
   });
 
